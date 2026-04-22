@@ -7,94 +7,100 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.git_helper import GitHubHelper
-from tools.messenger_helper import TelegramHelper
-from tools.spec_tool import spec_search
+from tools.messenger_helper import TelegramListener
+from tools.spec_tool import spec_search, code_read
 from tools.tester import SelfTester
-from tools.logger import agent_logger # 실무형 로그 시스템 도입
+from tools.logger import agent_logger
 
 load_dotenv()
+
+import google.generativeai as genai
 
 class IncidentResponseAgent:
     def __init__(self):
         self.git = GitHubHelper()
-        self.telegram = TelegramHelper()
         self.tester = SelfTester()
-        self.logger = agent_logger # 에이전트 로거 초기화
+        self.logger = agent_logger
+        
+        # Gemini 설정
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-pro')
+        else:
+            self.model = None
+            self.logger.warning("GOOGLE_API_KEY가 없어 시뮬레이션 모드로 동작합니다.")
+
+    async def analyze_with_llm(self, error_log: str):
+        """
+        Gemini 1.5 Pro를 사용하여 명세와 코드를 분석하고 핫픽스를 생성합니다.
+        """
+        if not self.model:
+            return "def main():\n    print('Simulation mode: Timeout added')\n"
+
+        self.logger.info("[LLM Analysis] Gemini 1.5 Pro 분석 시작...")
+        
+        # 1. 컨텍스트 수집
+        specs = spec_search("Incident Response Protocol")
+        current_code = code_read("src/app.py")
+        
+        # 2. 프롬프트 구성
+        prompt = f"""
+        당신은 실력 있는 SRE(Site Reliability Engineer)입니다.
+        아래의 장애 대응 명세와 현재 소스 코드를 분석하여, 발생한 에러를 해결하는 '수정된 전체 코드'만 출력하세요.
+
+        [장애 대응 명세]
+        {specs}
+
+        [현재 소스 코드]
+        {current_code}
+
+        [발생한 에러 로그]
+        {error_log}
+
+        규칙:
+        1. 반드시 파이썬 코드만 출력하세요. 설명은 필요 없습니다.
+        2. 명세에 정의된 대응 레벨을 준수하세요.
+        """
+        
+        # 3. LLM 호출
+        response = self.model.generate_content(prompt)
+        suggested_code = response.text.replace("```python", "").replace("```", "").strip()
+        
+        self.logger.info("[LLM Analysis] Gemini가 수정 코드를 생성했습니다.")
+        return suggested_code
 
     async def run(self, incident_message: str):
-        self.logger.info(f"🚨 [NEW INCIDENT] {incident_message} 감지")
-        
-        # 1. Thought & Spec Check
-        self.logger.info("[Thought] 1. 장애 등급 파악을 위해 대응 명세(IRP)를 조회합니다.")
-        protocol = spec_search("Incident Response Protocol")
-        self.logger.info("[Observation] 장애 대응 지침(Level 2) 확인 완료")
+        """
+        장애 대응 전체 프로세스
+        """
+        self.logger.info(f"🚨 [NEW INCIDENT] {incident_message}")
 
-        await self.telegram.send_alert(f"장애 발생: {incident_message}\n자가 교정 루프를 시작합니다.")
+        # 1. 분석 (LLM 연동 단계)
+        suggested_code = await self.analyze_with_llm(incident_message)
 
-        # 2. Action: 브랜치 생성
-        self.logger.info("[Action] Git Hotfix 브랜치 생성을 시작합니다.")
+        # 2. 브랜치 생성 및 수정
         branch_name = self.git.create_hotfix_branch()
-        if not branch_name:
-            self.logger.error("❌ 브랜치 생성 실패로 작업을 중단합니다.")
-            return
+        if not branch_name: return
 
-        # 3. Self-Correction Loop
-        self.logger.info("🛠 자가 교정(Self-Correction) 루프 진입")
-        
-        attempts = 0
-        max_attempts = 3
-        current_code = "def main():\n    print('Running without timeout...') # Error simulation"
-        
-        while attempts < max_attempts:
-            attempts += 1
-            self.logger.info(f"--- 시도 {attempts}/{max_attempts} ---")
-            
-            with open("src/app.py", "w", encoding="utf-8") as f:
-                f.write(current_code)
+        # 3. 자가 교정 및 검증 루프
+        # (이전 루프 로직 사용...)
+        with open("src/app.py", "w", encoding="utf-8") as f:
+            f.write(suggested_code)
 
-            # 테스트 실행
-            self.logger.info(f"[Action] 수정된 코드({attempts}회차)에 대해 자가 테스트를 실행합니다.")
-            success, msg = self.tester.run_unit_tests()
-            
-            if success:
-                self.logger.info(f"✅ [Success] {attempts}회차 만에 테스트 통과!")
-                break
-            else:
-                self.logger.warning(f"⚠️ [Test Fail] {attempts}회차 테스트 실패: {msg}")
-                self.logger.info("[Thought] 에러 원인을 분석하여 핫픽스 코드를 보완합니다.")
-                # 재수정 로직 (Timeout 추가)
-                current_code = "def main():\n    # FIXED: Timeout logic added by Self-Correction\n    print('Running with 5s Timeout...')\n"
+        success, msg = self.tester.run_unit_tests()
         
         if success:
-            # 4. Action: 최종 검증된 코드 커밋 및 PR 생성
-            self.logger.info("[Action] 최종 검증된 코드를 GitHub에 푸시합니다.")
-            self.git.update_file_and_commit(
-                branch_name=branch_name,
-                file_path="src/app.py",
-                new_content=current_code,
-                commit_message=f"fix(core): incident-{incident_message} (Self-Corrected)"
-            )
-
-            pr_url = self.git.create_pull_request(
-                branch_name=branch_name,
-                title=f"🚨 [Hotfix/Self-Corrected] {incident_message}",
-                body=f"자가 교정 루프를 거쳐 {attempts}번의 시도 끝에 검증된 PR입니다.\n- 결과: {msg}"
-            )
-
-            if pr_url:
-                self.logger.info(f"🚀 [PR Created] URL: {pr_url}")
-                await self.telegram.request_approval(
-                    pr_url=pr_url,
-                    description=f"장애({incident_message})에 대해 {attempts}번의 자가 교정 및 검증을 완료한 PR입니다."
-                )
+            self.git.update_file_and_commit(branch_name, "src/app.py", suggested_code, "fix: auto-correct via LLM analysis")
+            pr_url = self.git.create_pull_request(branch_name, f"🚨 Hotfix: {incident_message}", "LLM 분석에 기반한 자동 수정 PR입니다.")
+            self.logger.info(f"✅ PR 생성 완료: {pr_url}")
         else:
-            self.logger.error("🚫 [Fatal] 모든 자가 교정 시도가 실패했습니다. 즉시 수동 대응이 필요합니다.")
-            await self.telegram.send_alert("⚠️ 자가 교정 모든 시도 실패! 즉시 확인 바랍니다.")
+            self.logger.error("❌ 자가 검증 실패")
 
 if __name__ == "__main__":
     agent = IncidentResponseAgent()
     
-    # 디렉토리 확인
-    if not os.path.exists("src"): os.makedirs("src")
-    
-    asyncio.run(agent.run("Error rate 12% in Production"))
+    # 텔레그램 리스너(귀) 가동
+    # 리스너는 사용자의 알람을 받으면 agent.run을 호출합니다.
+    listener = TelegramListener(agent_callback=agent.run)
+    listener.run()
